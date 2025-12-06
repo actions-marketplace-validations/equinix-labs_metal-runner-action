@@ -25,19 +25,36 @@ inputs:
   provisioning_timeout:
     description: "Equinix Metal Provisioning Timeout for Github self-hosted runner"
     default: "30"
+  repository_level:
+    description: "Set to true to enable repository level registration token"
+    default: "false"
+  custom_script:
+    description: "Custom user script to run (as root) before starting the runner"
+    default: ""
 runs:
   using: "composite"
   steps:
     - run: |
-        echo "registration-token=$(
-        curl -fsSL \
+        # Determine the level and runner scope based on inputs
+        if  [[ "${{ inputs.repository_level }}" == "true" ]] || [[ -z "${{ github.organization }}" ]]; then
+          level="repos"
+          runner_scope="${{ github.repository }}"
+        else
+          level="orgs"
+          runner_scope="${{ github.organization }}"
+        fi
+        # Get the registration token
+        registration_token=$(curl -fsSL \
         -X POST \
         -H 'accept: application/vnd.github+json' \
         -H 'authorization: Bearer ${{ inputs.github_token }}' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
-        --url https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token | jq .token)" >> $GITHUB_OUTPUT
+        --url "https://api.github.com/$level/$runner_scope/actions/runners/registration-token" | jq .token)
+        # Output the registration token and runner scope
+        echo "registration_token=$registration_token" >> $GITHUB_OUTPUT
+        echo "runner_scope=$runner_scope" >> $GITHUB_OUTPUT
       shell: bash
-      id: get-registration-token
+      id: get-registration
     - name: Create Device
       uses: equinix-labs/metal-device-action@main
       with:
@@ -49,17 +66,48 @@ runs:
         provisioning_timeout: ${{ inputs.provisioning_timeout }}
         user_data: |
           #!/bin/bash
-          export DEBIAN_FRONTEND=noninteractive 
-          apt-get -qy update
-          apt-get -qy install build-essential gcc jq
+          set -e  # Exit immediately if any command exits with a non-zero status
+
+          # Install necessary packages based on OS
+          if command -v yum &> /dev/null; then
+            yum install -y curl jq libicu gcc
+          else
+            export DEBIAN_FRONTEND=noninteractive 
+            apt-get -qy update
+            apt-get -qy install build-essential gcc jq
+          fi
+
+          # Create a user for runner
           useradd -m ghrunner -s /bin/bash
           cd /home/ghrunner
           mkdir runner
+
+          # Download and install GitHub actions runner
           VERSION=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/^v//')
           curl -o actions-runner-linux-x64-${VERSION}.tar.gz -fsSL https://github.com/actions/runner/releases/download/v${VERSION}/actions-runner-linux-x64-${VERSION}.tar.gz
           tar xzf ./actions-runner-linux-x64-${VERSION}.tar.gz -C runner
           chown -R ghrunner ./runner
           cd runner
-          sudo -E -u ghrunner ./config.sh --unattended --url https://github.com/${{ github.repository }} --token ${{ steps.get-registration-token.outputs.registration-token }} --name $(hostname) --work /home/ghrunner --labels ${{ github.repository }} --ephemeral
+
+          # Configure the runner
+          sudo -E -u ghrunner ./config.sh --unattended --url https://github.com/${{ steps.get-registration.outputs.runner_scope }} \
+            --token ${{ steps.get-registration.outputs.registration_token }} --name $(hostname) --work /home/ghrunner \
+            --labels ${{ steps.get-registration.outputs.runner_scope }} --ephemeral
+
+          # Running custom script if provided
+          CUSTOM_SCRIPT=$(mktemp $HOME/custom_script.XXXXXX.sh)
+          cat > $CUSTOM_SCRIPT <<'CUSTOM_SCRIPT_EOF'
+          ${{ inputs.custom_script }}
+          CUSTOM_SCRIPT_EOF
+
+          if [[ -s $CUSTOM_SCRIPT ]]; then
+              chmod 0700 $CUSTOM_SCRIPT
+              echo "Running custom user script"
+              $CUSTOM_SCRIPT
+          else
+              rm $CUSTOM_SCRIPT
+          fi
+
+          # Install and start the runner service
           ./svc.sh install
           ./svc.sh start
